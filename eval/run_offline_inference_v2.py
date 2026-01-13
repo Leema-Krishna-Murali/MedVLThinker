@@ -55,6 +55,66 @@ from vllm import LLM, SamplingParams
 from vllm.utils import get_open_port
 
 
+def _norm_name(s: str) -> str:
+    """Normalize dataset/config names for loose matching."""
+    return (
+        (s or "")
+        .strip()
+        .lower()
+        .replace("_", "")
+        .replace("-", "")
+        .replace(" ", "")
+    )
+
+
+def load_eval_split(*, dataset_name: str, subset: str | None, split: str, num_proc: int):
+    """
+    Load a dataset split.
+
+    HF datasets can be published either:
+    - with multiple configs (subset names like "PathVQA", "VQA-RAD", ...)
+    - or with a single "default" config and a `dataset_name` column that
+      indicates which benchmark each row belongs to.
+
+    This helper supports both layouts.
+    """
+    try:
+        if subset:
+            return load_dataset(dataset_name, subset)[split]
+        return load_dataset(dataset_name)[split]
+    except ValueError as e:
+        # Common failure mode:
+        # ValueError: BuilderConfig 'VQA-RAD' not found. Available: ['default']
+        msg = str(e)
+        if "BuilderConfig" not in msg:
+            raise
+
+        ds = load_dataset(dataset_name)[split]
+        if not subset:
+            return ds
+
+        if "dataset_name" not in ds.column_names:
+            raise ValueError(
+                f"Requested subset '{subset}', but dataset '{dataset_name}' has only "
+                f"config(s) {[c.name for c in load_dataset(dataset_name).values()] if False else ['default']} "
+                "and does not contain a 'dataset_name' column to filter by."
+            ) from e
+
+        target = _norm_name(subset)
+        ds = ds.filter(
+            lambda row: _norm_name(row.get("dataset_name", "")) == target,
+            num_proc=num_proc,
+            keep_in_memory=True,
+        )
+        if len(ds) == 0:
+            raise ValueError(
+                f"Subset '{subset}' not found inside '{dataset_name}'. "
+                "Try omitting --subset to evaluate all benchmarks, or inspect unique values of the "
+                "'dataset_name' column."
+            ) from e
+        return ds
+
+
 def main(**kwargs):
     try:
         _main(**kwargs)
@@ -106,7 +166,9 @@ def _main(
     dataset_size = args.dataset_size
     num_proc = args.num_proc
 
-    ds = load_dataset(dataset_name, subset)[split]
+    ds = load_eval_split(
+        dataset_name=dataset_name, subset=subset, split=split, num_proc=num_proc
+    )
     if dataset_size:
         ds = ds.select(range(dataset_size))
 
