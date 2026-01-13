@@ -311,10 +311,45 @@ def grade_answer(prediction, answer, answer_label=None):
 
 
 def build_prompt(row, processor, args):
+    """
+    Build vLLM offline-inference inputs.
+
+    Important: for vision-language models, vLLM expects the *prompt text* to
+    contain the model-specific image placeholder tokens so it can replace them
+    with multimodal embeddings. The safest way to do that (across vLLM/transformers
+    versions) is to let the HF `processor` render the chat template, and then
+    pass the corresponding `multi_modal_data`.
+    """
     messages = build_messages(row, args)
-    if getattr(args, "debug", False):
-        print(f"Prompt: {messages}...")
-    return messages
+
+    prompt = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    if args.ignore_image:
+        return {"prompt": prompt}
+
+    image_inputs, video_inputs, video_kwargs = process_vision_info(
+        messages, return_video_kwargs=True
+    )
+
+    if image_inputs is None and video_inputs is None:
+        # No multimodal items for this sample.
+        return {"prompt": prompt}
+
+    mm_data = {}
+    if image_inputs is not None:
+        mm_data["image"] = image_inputs
+    if video_inputs is not None:
+        mm_data["video"] = video_inputs
+
+    return {
+        "prompt": prompt,
+        "multi_modal_data": mm_data,
+        "mm_processor_kwargs": video_kwargs,
+    }
 
 
 INSTRUCTION_PROMPT = r"You will solve a problem/request. You should provide your thoughts within <think> </think> tags before providing the answer.\nWrite your final answer within <answer> </answer> tags."
@@ -335,34 +370,23 @@ def build_messages(row, args):
 
     images = row.get("images", None)
     if images is None or args.ignore_image:
-        images_input = {}
+        images = []
     else:
         # NOTE(xk) convert the PIL images to RGB format, gemma processor only accepts RGB images
         images = [image.convert("RGB") for image in images]
 
-        images_input = {
-            "multi_modal_data": {"image": images},
+    # Let the HF processor decide how to represent images in the prompt.
+    # This avoids vLLM placeholder-mismatch errors like:
+    # "Failed to apply prompt replacement for mm_items['image'][0]".
+    return [
+        {
+            "role": "user",
+            "content": [
+                *[{"type": "image", "image": img} for img in images],
+                {"type": "text", "text": prompt},
+            ],
         }
-        # NOTE(xk): the prompt format of different multi-modal llm is different
-        # check here for more: https://github.com/vllm-project/vllm/blob/9f414a12adb991d04d2adf0b80f1f115d6281fad/examples/offline_inference/vision_language.py#L208-L210
-        model_prompt_type = getattr(args, "model_prompt_type", None)
-        if model_prompt_type is None:
-            prompt = "<image>\n" * len(images) + prompt
-        elif model_prompt_type == "gemma3":
-            prompt = (
-                "<bos><start_of_turn>user\n"
-                + f'{"<start_of_image>"*len(images)}'
-                + f"{prompt}<end_of_turn>\n"
-                + "<start_of_turn>model\n"
-            )
-
-        else:
-            print(f"Unknown model_prompt_type: {model_prompt_type}.")
-
-    return {
-        "prompt": prompt,
-        **images_input,
-    }
+    ]
 
 
 @click.command()
